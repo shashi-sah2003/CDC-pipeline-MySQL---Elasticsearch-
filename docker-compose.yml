@@ -1,0 +1,110 @@
+services:
+  db:
+    image: "mysql:8"
+    container_name: mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    environment:
+      - MYSQL_DATABASE=cdc_db_elasticsearch
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_LOG_CONSOLE=true
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql_config:/etc/mysql/conf.d
+    ports:
+      - "3307:3306"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    volumes:
+      - ./init/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./init/definitions.json:/etc/rabbitmq/definitions.json:ro
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  debezium:
+    image: quay.io/debezium/server:3.1
+    container_name: debezium
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: on-failure
+    environment:
+      - DEBEZIUM_SOURCE_DATABASE_HOSTNAME=db
+      - DEBEZIUM_SOURCE_DATABASE_PORT=3306
+      - WAIT_FOR_RABBITMQ=true
+      - WAIT_FOR_RABBITMQ_TIMEOUT=60
+      - DEBEZIUM_SOURCE_SNAPSHOT_MODE=initial
+    volumes:
+      - ./debezium_conf:/debezium/config:ro
+      - debezium_data:/debezium/data
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.1
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1m" ]
+      interval: 10s
+      timeout: 70s
+      retries: 5
+
+  elasticsearch_consumer:
+    build:
+      context: ./elasticsearch
+    container_name: elasticsearch_consumer
+    restart: on-failure
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - CLOUDAMQP_URL=amqp://guest:guest@rabbitmq:5672/
+  
+  product_insertion:
+    build:
+      context: ./product_insertion/
+    image: product_insertion
+    container_name: product_insertion
+    healthcheck:
+      test: [ "CMD", "python", "-c", "from database.conn import engine; engine.connect()" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: on-failure
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      debezium:
+        condition: service_started
+      elasticsearch:
+        condition: service_healthy
+      elasticsearch_consumer:
+        condition: service_started
+volumes:
+  mysql_data:
+  es_data:
+  debezium_data:
